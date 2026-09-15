@@ -135,9 +135,17 @@ impl Config {
         let public_delivery_url = req(e, "BUZZ_PUSH_PUBLIC_DELIVERY_URL")?
             .parse::<url::Url>()
             .map_err(|_| ConfigError::Invalid("BUZZ_PUSH_PUBLIC_DELIVERY_URL"))?;
+        let expected_authority = e
+            .get("BUZZ_PUSH_DELIVERY_HOST")
+            .map(String::as_str)
+            .filter(|v| !v.is_empty())
+            .unwrap_or("push.buzz.xyz");
+        let url_authority = match public_delivery_url.port() {
+            Some(port) => format!("{}:{}", public_delivery_url.host_str().unwrap(), port),
+            None => public_delivery_url.host_str().unwrap().to_owned(),
+        };
         if public_delivery_url.scheme() != "https"
-            || public_delivery_url.host_str() != Some("push.buzz.xyz")
-            || public_delivery_url.port().is_some()
+            || url_authority != expected_authority
             || public_delivery_url.path() != "/v1/deliveries/apns"
             || public_delivery_url.query().is_some()
             || public_delivery_url.fragment().is_some()
@@ -328,6 +336,58 @@ mod tests {
             env.insert("BUZZ_PUSH_TOKEN_KEYS".into(), token_keys);
             assert!(Config::from_map(&env).is_err());
         }
+    }
+
+    #[test]
+    fn delivery_host_override_accepts_non_buzz_url() {
+        let mut env = base();
+        env.insert(
+            "BUZZ_PUSH_DELIVERY_HOST".into(),
+            "spark-289c.tailc3d2bd.ts.net:8444".into(),
+        );
+        env.insert(
+            "BUZZ_PUSH_PUBLIC_DELIVERY_URL".into(),
+            "https://spark-289c.tailc3d2bd.ts.net:8444/v1/deliveries/apns".into(),
+        );
+        let config = Config::from_map(&env).unwrap();
+        assert_eq!(
+            config.public_delivery_url.as_str(),
+            "https://spark-289c.tailc3d2bd.ts.net:8444/v1/deliveries/apns"
+        );
+    }
+
+    #[test]
+    fn delivery_host_override_still_rejects_http() {
+        let mut env = base();
+        env.insert(
+            "BUZZ_PUSH_DELIVERY_HOST".into(),
+            "spark-289c.tailc3d2bd.ts.net:8444".into(),
+        );
+        env.insert(
+            "BUZZ_PUSH_PUBLIC_DELIVERY_URL".into(),
+            "http://spark-289c.tailc3d2bd.ts.net:8444/v1/deliveries/apns".into(),
+        );
+        assert!(
+            Config::from_map(&env).is_err(),
+            "http:// must be rejected even with host override"
+        );
+    }
+
+    #[test]
+    fn delivery_host_override_mismatch_rejects() {
+        let mut env = base();
+        env.insert(
+            "BUZZ_PUSH_DELIVERY_HOST".into(),
+            "expected-host.example".into(),
+        );
+        env.insert(
+            "BUZZ_PUSH_PUBLIC_DELIVERY_URL".into(),
+            "https://other-host.example/v1/deliveries/apns".into(),
+        );
+        assert!(
+            Config::from_map(&env).is_err(),
+            "mismatched host must be rejected"
+        );
     }
 
     #[test]
