@@ -1,31 +1,67 @@
 use super::*;
 use crate::{relay_members, thread};
 use buzz_core::CommunityId;
+use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use sqlx::{Connection, PgPool};
-use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1 -- local test-only credentials
 
-#[derive(Default)]
-struct CapturingConnectionObserver(Mutex<Vec<DbConnectionLifecycleEvent>>);
+type ConnectionCounters = std::collections::BTreeMap<(String, String, Option<String>), u64>;
 
-impl DbConnectionObserver for CapturingConnectionObserver {
-    fn record(&self, event: DbConnectionLifecycleEvent) {
-        self.0
-            .lock()
-            .expect("capture connection lifecycle event")
-            .push(event);
-    }
+fn connection_counters(snapshotter: &Snapshotter) -> ConnectionCounters {
+    snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter_map(|(key, _, _, value)| {
+            let metric_name = key.key().name();
+            if ![
+                "buzz_db_connection_step_started_total",
+                "buzz_db_connection_step_attempts_total",
+            ]
+            .contains(&metric_name)
+            {
+                return None;
+            }
+            let DebugValue::Counter(value) = value else {
+                panic!("{metric_name} must be a counter");
+            };
+            let labels = key
+                .key()
+                .labels()
+                .map(|label| (label.key().to_owned(), label.value().to_owned()))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            assert_eq!(labels.get("pool_role").map(String::as_str), Some("writer"));
+            Some((
+                (
+                    metric_name.to_owned(),
+                    labels
+                        .get("step")
+                        .expect("connection step label")
+                        .to_owned(),
+                    labels.get("outcome").cloned(),
+                ),
+                value,
+            ))
+        })
+        .collect()
 }
 
-impl CapturingConnectionObserver {
-    fn events(&self) -> Vec<DbConnectionLifecycleEvent> {
-        self.0
-            .lock()
-            .expect("read connection lifecycle events")
-            .clone()
-    }
+fn connection_counter(
+    counters: &ConnectionCounters,
+    metric_name: &str,
+    step: DbConnectionStep,
+    outcome: Option<DbConnectionOutcome>,
+) -> u64 {
+    counters
+        .get(&(
+            metric_name.to_owned(),
+            step.as_str().to_owned(),
+            outcome.map(|outcome| outcome.as_str().to_owned()),
+        ))
+        .copied()
+        .unwrap_or_default()
 }
 
 async fn setup_db() -> Db {
@@ -2538,7 +2574,7 @@ async fn created_at_floor_guard_aborts_old_channel_rows_at_commit() {
 fn writer_pool_safety_hook_is_single_and_composed() {
     let source = include_str!("mod.rs");
     let connect_pool = source
-        .split("async fn connect_writer_pool_with_observer")
+        .split("async fn connect_writer_pool")
         .nth(1)
         .and_then(|tail| tail.split("const READER_ACQUIRE_TIMEOUT").next())
         .expect("connect_writer_pool source block");
@@ -2568,123 +2604,149 @@ fn writer_pool_safety_hook_is_single_and_composed() {
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires Postgres"]
-async fn writer_pool_observer_records_every_initial_connection_ready() {
-    let observer = Arc::new(CapturingConnectionObserver::default());
-    let db = Db::new_with_connection_observer(
-        &DbConfig {
-            database_url: crate::test_support::database_url(),
-            max_connections: 2,
-            min_connections: 2,
-            ..DbConfig::default()
-        },
-        observer.clone(),
-    )
+async fn writer_pool_metrics_record_every_initial_connection_ready() {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let db = Db::new(&DbConfig {
+        database_url: crate::test_support::database_url(),
+        max_connections: 2,
+        min_connections: 2,
+        ..DbConfig::default()
+    })
     .await
-    .expect("connect observed writer pool");
+    .expect("connect instrumented writer pool");
+    let counters = connection_counters(&snapshotter);
 
-    let events = observer.events();
     assert_eq!(
-        events.first().map(|event| (event.step(), event.edge())),
-        Some((DbConnectionStep::WriterPool, DbConnectionEdge::Started))
-    );
-    assert_eq!(
-        events.last().map(|event| (event.step(), event.outcome())),
-        Some((
+        connection_counter(
+            &counters,
+            "buzz_db_connection_step_started_total",
             DbConnectionStep::WriterPool,
-            Some(DbConnectionOutcome::Succeeded)
-        ))
+            None,
+        ),
+        1
     );
-    for ordinal in [1, 2] {
-        let connection_events = events
-            .iter()
-            .filter(|event| event.connection_ordinal() == Some(ordinal))
-            .collect::<Vec<_>>();
+    assert_eq!(
+        connection_counter(
+            &counters,
+            "buzz_db_connection_step_attempts_total",
+            DbConnectionStep::WriterPool,
+            Some(DbConnectionOutcome::Succeeded),
+        ),
+        1
+    );
+    assert_eq!(
+        connection_counter(
+            &counters,
+            "buzz_db_connection_step_attempts_total",
+            DbConnectionStep::PhysicalConnect,
+            Some(DbConnectionOutcome::Succeeded),
+        ),
+        2
+    );
+    for step in [
+        DbConnectionStep::CreatedAtFloor,
+        DbConnectionStep::SessionTimeouts,
+        DbConnectionStep::Isolation,
+    ] {
         assert_eq!(
-            connection_events
-                .iter()
-                .filter(|event| event.edge() == DbConnectionEdge::Terminal)
-                .map(|event| (event.step(), event.outcome()))
-                .collect::<Vec<_>>(),
-            [
-                (
-                    DbConnectionStep::PhysicalConnect,
-                    Some(DbConnectionOutcome::Succeeded)
-                ),
-                (
-                    DbConnectionStep::CreatedAtFloor,
-                    Some(DbConnectionOutcome::Succeeded)
-                ),
-                (
-                    DbConnectionStep::SessionTimeouts,
-                    Some(DbConnectionOutcome::Succeeded)
-                ),
-                (
-                    DbConnectionStep::Isolation,
-                    Some(DbConnectionOutcome::Succeeded)
-                ),
-                (
-                    DbConnectionStep::Ready,
-                    Some(DbConnectionOutcome::Succeeded)
-                ),
-            ]
+            connection_counter(
+                &counters,
+                "buzz_db_connection_step_started_total",
+                step,
+                None,
+            ),
+            2,
+            "every initial connection must start {}",
+            step.as_str(),
+        );
+        assert_eq!(
+            connection_counter(
+                &counters,
+                "buzz_db_connection_step_attempts_total",
+                step,
+                Some(DbConnectionOutcome::Succeeded),
+            ),
+            2,
+            "every initial connection must complete {}",
+            step.as_str(),
         );
     }
+    assert_eq!(
+        connection_counter(
+            &counters,
+            "buzz_db_connection_step_attempts_total",
+            DbConnectionStep::Ready,
+            Some(DbConnectionOutcome::Succeeded),
+        ),
+        2
+    );
     db.pool.close().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires Postgres"]
-async fn writer_pool_observer_records_connection_created_after_startup() {
-    let observer = Arc::new(CapturingConnectionObserver::default());
-    let pool = Db::connect_writer_pool_with_observer(
-        &DbConfig {
-            database_url: crate::test_support::database_url(),
-            max_connections: 2,
-            min_connections: 1,
-            ..DbConfig::default()
-        },
-        observer.clone(),
-    )
+async fn writer_pool_metrics_record_connection_created_after_startup() {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let pool = Db::connect_writer_pool(&DbConfig {
+        database_url: crate::test_support::database_url(),
+        max_connections: 2,
+        min_connections: 1,
+        ..DbConfig::default()
+    })
     .await
-    .expect("connect observed size-one writer pool");
-    let initial_ready = observer
-        .events()
-        .iter()
-        .filter(|event| event.step() == DbConnectionStep::Ready)
-        .count();
-    assert_eq!(initial_ready, 1);
+    .expect("connect instrumented size-one writer pool");
+    let startup_counters = connection_counters(&snapshotter);
+    assert_eq!(
+        connection_counter(
+            &startup_counters,
+            "buzz_db_connection_step_attempts_total",
+            DbConnectionStep::Ready,
+            Some(DbConnectionOutcome::Succeeded),
+        ),
+        1
+    );
 
     let first = pool.acquire().await.expect("hold initial connection");
     let second = pool
         .acquire()
         .await
         .expect("grow pool with a second connection");
-    let events = observer.events();
+    let growth_counters = connection_counters(&snapshotter);
     assert_eq!(
-        events
-            .iter()
-            .filter(|event| {
-                event.step() == DbConnectionStep::Ready
-                    && event.outcome() == Some(DbConnectionOutcome::Succeeded)
-            })
-            .count(),
-        2,
-        "a post-startup pool growth connection must traverse the same observed safety hook"
+        connection_counter(
+            &growth_counters,
+            "buzz_db_connection_step_attempts_total",
+            DbConnectionStep::Ready,
+            Some(DbConnectionOutcome::Succeeded),
+        ),
+        1,
+        "a post-startup pool growth connection must traverse the same instrumented safety hook"
     );
-    assert!(events.iter().any(|event| {
-        event.connection_ordinal() == Some(2)
-            && event.step() == DbConnectionStep::PhysicalConnect
-            && event.outcome() == Some(DbConnectionOutcome::Succeeded)
-    }));
+    assert_eq!(
+        connection_counter(
+            &growth_counters,
+            "buzz_db_connection_step_attempts_total",
+            DbConnectionStep::PhysicalConnect,
+            Some(DbConnectionOutcome::Succeeded),
+        ),
+        1,
+    );
 
     drop(second);
     drop(first);
     pool.close().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 #[ignore = "requires Postgres"]
 async fn writer_pool_rejects_non_read_committed_database_default() {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
     let admin = PgPool::connect(&admin_url().await)
         .await
         .expect("connect admin");
@@ -2700,17 +2762,13 @@ async fn writer_pool_rejects_non_read_committed_database_default() {
     let base = admin_url().await;
     let idx = base.rfind('/').expect("db url has a path segment");
     let scratch_url = format!("{}/{}", &base[..idx], name);
-    let observer = Arc::new(CapturingConnectionObserver::default());
-    let error = Db::new_with_connection_observer(
-        &DbConfig {
-            database_url: scratch_url,
-            max_connections: 1,
-            min_connections: 1,
-            acquire_timeout_secs: 1,
-            ..DbConfig::default()
-        },
-        observer.clone(),
-    )
+    let error = Db::new(&DbConfig {
+        database_url: scratch_url,
+        max_connections: 1,
+        min_connections: 1,
+        acquire_timeout_secs: 1,
+        ..DbConfig::default()
+    })
     .await
     .expect_err("writer pool must reject pinned-snapshot database defaults");
     assert!(
@@ -2718,17 +2776,25 @@ async fn writer_pool_rejects_non_read_committed_database_default() {
             || error.to_string().contains("pool timed out"),
         "unexpected isolation rejection: {error}"
     );
-    let events = observer.events();
-    assert!(events.iter().any(|event| {
-        event.step() == DbConnectionStep::Isolation
-            && event.outcome() == Some(DbConnectionOutcome::Failed)
-            && event.reason() == Some(DbConnectionReason::IsolationMismatch)
-    }));
+    let counters = connection_counters(&snapshotter);
     assert!(
-        !events
-            .iter()
-            .any(|event| event.step() == DbConnectionStep::Ready),
-        "an isolation-rejected connection must never emit ready"
+        connection_counter(
+            &counters,
+            "buzz_db_connection_step_attempts_total",
+            DbConnectionStep::Isolation,
+            Some(DbConnectionOutcome::Failed),
+        ) > 0,
+        "the failing production hook must record the isolation failure"
+    );
+    assert_eq!(
+        connection_counter(
+            &counters,
+            "buzz_db_connection_step_attempts_total",
+            DbConnectionStep::Ready,
+            Some(DbConnectionOutcome::Succeeded),
+        ),
+        0,
+        "an isolation-rejected connection must never reach ready"
     );
 
     sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -2739,38 +2805,57 @@ async fn writer_pool_rejects_non_read_committed_database_default() {
     .expect("drop isolation test database");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 #[ignore = "requires Postgres"]
-async fn writer_pool_observer_stops_after_session_timeout_setup_failure() {
-    let observer = Arc::new(CapturingConnectionObserver::default());
-    let error = Db::new_with_connection_observer(
-        &DbConfig {
-            database_url: crate::test_support::database_url(),
-            max_connections: 1,
-            min_connections: 1,
-            acquire_timeout_secs: 1,
-            statement_timeout_ms: u64::MAX,
-            ..DbConfig::default()
-        },
-        observer.clone(),
-    )
+async fn writer_pool_metrics_stop_after_session_timeout_setup_failure() {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let error = Db::new(&DbConfig {
+        database_url: crate::test_support::database_url(),
+        max_connections: 1,
+        min_connections: 1,
+        acquire_timeout_secs: 1,
+        statement_timeout_ms: u64::MAX,
+        ..DbConfig::default()
+    })
     .await
     .expect_err("Postgres must reject an out-of-range statement timeout");
     assert!(
         error.to_string().contains("pool timed out")
             || error.to_string().contains("invalid value for parameter")
     );
+    let counters = connection_counters(&snapshotter);
 
-    let events = observer.events();
-    assert!(events.iter().any(|event| {
-        event.step() == DbConnectionStep::SessionTimeouts
-            && event.outcome() == Some(DbConnectionOutcome::Failed)
-            && event.reason() == Some(DbConnectionReason::SessionSetup)
-    }));
-    assert!(!events.iter().any(|event| matches!(
-        event.step(),
-        DbConnectionStep::Isolation | DbConnectionStep::Ready
-    )));
+    assert!(
+        connection_counter(
+            &counters,
+            "buzz_db_connection_step_attempts_total",
+            DbConnectionStep::SessionTimeouts,
+            Some(DbConnectionOutcome::Failed),
+        ) > 0,
+        "the failing production hook must record the timeout-setup failure"
+    );
+    assert_eq!(
+        connection_counter(
+            &counters,
+            "buzz_db_connection_step_started_total",
+            DbConnectionStep::Isolation,
+            None,
+        ),
+        0,
+        "a timeout-setup failure must stop before isolation"
+    );
+    assert_eq!(
+        connection_counter(
+            &counters,
+            "buzz_db_connection_step_attempts_total",
+            DbConnectionStep::Ready,
+            Some(DbConnectionOutcome::Succeeded),
+        ),
+        0,
+        "a timeout-setup failure must never reach ready"
+    );
 }
 
 /// Session-timeout environment overrides retain PostgreSQL's `0 = disabled`

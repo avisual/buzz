@@ -214,17 +214,18 @@ internal phases. Raw connect failures before `after_connect` are classified on
 the aggregate `writer_pool` phase during initial construction. Outcomes are
 `succeeded`, `failed`, `timed_out`, and `cancelled` where valid.
 
+For a measurable phase on one pod, subtract all terminal outcomes from its
+start counter to derive the number of attempts currently in progress. The
+session phases run in order, so a later phase start also proves the earlier
+phases succeeded for that attempt.
+
 Four start counters, four 13-series histograms, and fifteen terminal counters
 create a hard ceiling of 71 raw Prometheus series per pod. Connection ordinals,
 database URLs, hosts, usernames, SQL, and raw errors are forbidden as metric
-labels. Fixed-schema `buzz_process_lifecycle` logs preserve exact per-pod event
-order and process-local connection ordinals; metrics provide bucketed trends.
+labels.
 
 When audit logging is enabled, the `buzz_db_connection_*` metric totals combine
-the main writer pool and the separate audit writer pool. Ordered
-`buzz_process_lifecycle` receipts and their connection ordinals cover only the
-main writer pool, so those receipts cannot be reconciled one-for-one with the
-combined metric totals.
+the main writer pool and the separate audit writer pool.
 
 ## Relay Pod extensions
 
