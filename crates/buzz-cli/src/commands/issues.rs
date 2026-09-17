@@ -488,6 +488,85 @@ pub async fn cmd_get_issue(client: &BuzzClient, event: &str) -> Result<(), CliEr
     Ok(())
 }
 
+/// Map a NIP-34 status event kind to its display name.
+fn status_kind_label(kind: u64) -> &'static str {
+    match kind {
+        1630 => "open",
+        1631 => "resolved",
+        1632 => "closed",
+        1633 => "draft",
+        _ => "unknown",
+    }
+}
+
+/// Find the latest trusted status event for an issue.
+///
+/// Trust rule (mirrors desktop `allowedActorsForRoot` in projectIssues.mjs):
+/// a status event is honoured only when signed by the issue author or the
+/// repo owner. Events signed by anyone else are stored by the relay but must
+/// be ignored by the fold.
+///
+/// Returns `(status_name, status_event_id)`. When no trusted status event
+/// exists, defaults to `("open", None)`.
+fn fold_issue_status(
+    issue_id: &str,
+    issue_author: &str,
+    repo_owner: &str,
+    status_events: &[serde_json::Value],
+) -> (String, Option<String>) {
+    let author = issue_author.to_ascii_lowercase();
+    let owner = repo_owner.to_ascii_lowercase();
+
+    let mut best: Option<(u64, u64, String)> = None; // (created_at, kind, event_id)
+
+    for ev in status_events {
+        let se_pk = match ev.get("pubkey").and_then(|v| v.as_str()) {
+            Some(p) => p.to_ascii_lowercase(),
+            None => continue,
+        };
+        if se_pk != author && se_pk != owner {
+            continue;
+        }
+
+        let has_e_tag = ev
+            .get("tags")
+            .and_then(|t| t.as_array())
+            .map(|tags| {
+                tags.iter().any(|tag| {
+                    tag.as_array()
+                        .map(|arr| {
+                            arr.first().and_then(|v| v.as_str()) == Some("e")
+                                && arr.get(1).and_then(|v| v.as_str()) == Some(issue_id)
+                        })
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        if !has_e_tag {
+            continue;
+        }
+
+        let created_at = ev.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0);
+        let kind = ev.get("kind").and_then(|v| v.as_u64()).unwrap_or(0);
+        let id = ev.get("id").and_then(|v| v.as_str()).unwrap_or("");
+
+        let better = match &best {
+            None => true,
+            Some((prev_at, _, prev_id)) if created_at > *prev_at => true,
+            Some((prev_at, _, prev_id)) if created_at == *prev_at && id > prev_id.as_str() => true,
+            _ => false,
+        };
+        if better {
+            best = Some((created_at, kind, id.to_string()));
+        }
+    }
+
+    match best {
+        Some((_, kind, id)) => (status_kind_label(kind).to_string(), Some(id)),
+        None => ("open".to_string(), None),
+    }
+}
+
 pub async fn cmd_list_issues(
     client: &BuzzClient,
     repo_owner: &str,
@@ -500,24 +579,56 @@ pub async fn cmd_list_issues(
     validate_repo_id(repo_id)?;
 
     let a_value = format!("30617:{repo_owner}:{repo_id}");
-    let mut filter = serde_json::json!({
+    let mut issue_filter = serde_json::json!({
         "kinds": [1621],
         "#a": [a_value]
     });
 
     if let Some(pk) = author {
         validate_hex64(pk)?;
-        filter["authors"] = serde_json::json!([pk]);
+        issue_filter["authors"] = serde_json::json!([pk]);
     }
     if let Some(l) = label {
-        filter["#t"] = serde_json::json!([l]);
+        issue_filter["#t"] = serde_json::json!([l]);
     }
     if let Some(n) = limit {
-        filter["limit"] = serde_json::json!(n);
+        issue_filter["limit"] = serde_json::json!(n);
     }
 
-    let resp = client.query(&filter).await?;
-    println!("{resp}");
+    let status_filter = serde_json::json!({
+        "kinds": [1630, 1631, 1632, 1633],
+        "#a": [a_value],
+        "limit": 500
+    });
+
+    let resp = client.query_multi(&[issue_filter, status_filter]).await?;
+    let events: Vec<serde_json::Value> = serde_json::from_str(&resp)
+        .map_err(|e| CliError::Other(format!("parse issue list: {e}")))?;
+
+    let mut issues: Vec<serde_json::Value> = Vec::new();
+    let mut status_events: Vec<serde_json::Value> = Vec::new();
+    for ev in &events {
+        let kind = ev.get("kind").and_then(|v| v.as_u64()).unwrap_or(0);
+        match kind {
+            1621 => issues.push(ev.clone()),
+            1630..=1633 => status_events.push(ev.clone()),
+            _ => {}
+        }
+    }
+
+    let owner_lower = repo_owner.to_ascii_lowercase();
+    for issue in &mut issues {
+        let issue_id = issue.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let issue_author = issue.get("pubkey").and_then(|v| v.as_str()).unwrap_or("");
+        let (status, event_id) =
+            fold_issue_status(issue_id, issue_author, &owner_lower, &status_events);
+        issue["status"] = serde_json::json!(status);
+        issue["status_event_id"] = serde_json::json!(event_id);
+    }
+
+    let out = serde_json::to_string_pretty(&issues)
+        .map_err(|e| CliError::Other(format!("serialize issue list: {e}")))?;
+    println!("{out}");
     Ok(())
 }
 
@@ -689,8 +800,8 @@ pub async fn dispatch(cmd: crate::IssuesCmd, client: &BuzzClient) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::{
-        assignment_note_label, reduce_assignment_operations, AssignmentEvent, AssignmentQueryEvent,
-        ISSUE_ASSIGNMENT_LABEL, ISSUE_UNASSIGNMENT_LABEL,
+        assignment_note_label, fold_issue_status, reduce_assignment_operations, status_kind_label,
+        AssignmentEvent, AssignmentQueryEvent, ISSUE_ASSIGNMENT_LABEL, ISSUE_UNASSIGNMENT_LABEL,
     };
 
     const ISSUE: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
@@ -841,5 +952,102 @@ mod tests {
 
         assert!(!state.assignees.contains(VOLUNTEER));
         assert_eq!(state.heads.get(VOLUNTEER), Some(&owner_unassign));
+    }
+
+    fn status_event_json(
+        id: &str,
+        pubkey: &str,
+        kind: u64,
+        created_at: u64,
+        issue_id: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "pubkey": pubkey,
+            "kind": kind,
+            "created_at": created_at,
+            "tags": [["e", issue_id, "", "root"]]
+        })
+    }
+
+    #[test]
+    fn status_kind_label_maps_nip34_kinds() {
+        assert_eq!(status_kind_label(1630), "open");
+        assert_eq!(status_kind_label(1631), "resolved");
+        assert_eq!(status_kind_label(1632), "closed");
+        assert_eq!(status_kind_label(1633), "draft");
+        assert_eq!(status_kind_label(9999), "unknown");
+    }
+
+    #[test]
+    fn fold_defaults_to_open_when_no_status_events() {
+        let (status, event_id) = fold_issue_status(ISSUE, AUTHOR, OWNER, &[]);
+        assert_eq!(status, "open");
+        assert_eq!(event_id, None);
+    }
+
+    #[test]
+    fn fold_honours_issue_author_status() {
+        let events = vec![status_event_json(&"1".repeat(64), AUTHOR, 1632, 100, ISSUE)];
+        let (status, event_id) = fold_issue_status(ISSUE, AUTHOR, OWNER, &events);
+        assert_eq!(status, "closed");
+        assert_eq!(event_id, Some("1".repeat(64)));
+    }
+
+    #[test]
+    fn fold_honours_repo_owner_status() {
+        let events = vec![status_event_json(&"2".repeat(64), OWNER, 1631, 100, ISSUE)];
+        let (status, event_id) = fold_issue_status(ISSUE, AUTHOR, OWNER, &events);
+        assert_eq!(status, "resolved");
+        assert_eq!(event_id, Some("2".repeat(64)));
+    }
+
+    #[test]
+    fn fold_ignores_untrusted_signer() {
+        let events = vec![status_event_json(
+            &"3".repeat(64),
+            VOLUNTEER,
+            1632,
+            100,
+            ISSUE,
+        )];
+        let (status, event_id) = fold_issue_status(ISSUE, AUTHOR, OWNER, &events);
+        assert_eq!(status, "open");
+        assert_eq!(event_id, None);
+    }
+
+    #[test]
+    fn fold_ignores_status_for_other_issue() {
+        let other_issue = "f".repeat(64);
+        let events = vec![status_event_json(
+            &"4".repeat(64),
+            AUTHOR,
+            1632,
+            100,
+            &other_issue,
+        )];
+        let (status, event_id) = fold_issue_status(ISSUE, AUTHOR, OWNER, &events);
+        assert_eq!(status, "open");
+        assert_eq!(event_id, None);
+    }
+
+    #[test]
+    fn fold_picks_latest_by_created_at() {
+        let older = status_event_json(&"b".repeat(64), AUTHOR, 1630, 100, ISSUE);
+        let newer = status_event_json(&"a".repeat(64), AUTHOR, 1632, 200, ISSUE);
+        let events = vec![older, newer];
+        let (status, event_id) = fold_issue_status(ISSUE, AUTHOR, OWNER, &events);
+        assert_eq!(status, "closed");
+        assert_eq!(event_id, Some("a".repeat(64)));
+    }
+
+    #[test]
+    fn fold_tiebreaks_by_event_id_when_same_timestamp() {
+        let low_id = status_event_json(&"a".repeat(64), AUTHOR, 1632, 100, ISSUE);
+        let high_id = status_event_json(&"b".repeat(64), AUTHOR, 1630, 100, ISSUE);
+        let events = vec![low_id, high_id];
+        let (status, event_id) = fold_issue_status(ISSUE, AUTHOR, OWNER, &events);
+        assert_eq!(status, "open");
+        assert_eq!(event_id, Some("b".repeat(64)));
     }
 }
