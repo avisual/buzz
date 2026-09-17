@@ -1,5 +1,12 @@
 import * as React from "react";
-import { Check, FolderPlus, Link, Plus, ShieldCheck } from "lucide-react";
+import {
+  Check,
+  FolderPlus,
+  Link,
+  Pencil,
+  Plus,
+  ShieldCheck,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import { useIsManagedAgent } from "@/features/agent-memory/hooks";
@@ -10,6 +17,7 @@ import { ownsAuthorAgent } from "@/features/profile/lib/identity";
 import { useAddProjectRepositoryMutation } from "@/features/projects/useAddProjectRepository";
 import { useAttachProjectRepositoryMutation } from "@/features/projects/useAttachProjectRepository";
 import { useBindProjectRepositoryChannelMutation } from "@/features/projects/useBindProjectRepositoryChannel";
+import { useUpdateRepositoryCloneUrlMutation } from "@/features/projects/useUpdateRepositoryCloneUrl";
 import { Button } from "@/shared/ui/button";
 import {
   DropdownMenu,
@@ -20,6 +28,7 @@ import {
 } from "@/shared/ui/dropdown-menu";
 import { AddProjectRepositoryDialog } from "./AddProjectRepositoryDialog";
 import { AttachProjectRepositoryDialog } from "./AttachProjectRepositoryDialog";
+import { EditRepositoryCloneUrlDialog } from "./EditRepositoryCloneUrlDialog";
 
 export function ProjectRepositoryManagement({
   compact = false,
@@ -47,10 +56,12 @@ export function ProjectRepositoryManagement({
   const createOpen = createOpenProp ?? uncontrolledCreateOpen;
   const setCreateOpen = onCreateOpenChange ?? setUncontrolledCreateOpen;
   const [attachOpen, setAttachOpen] = React.useState(false);
+  const [editCloneUrlOpen, setEditCloneUrlOpen] = React.useState(false);
   const channelsQuery = useChannelsQuery();
   const createMutation = useAddProjectRepositoryMutation();
   const attachMutation = useAttachProjectRepositoryMutation();
   const repairMutation = useBindProjectRepositoryChannelMutation();
+  const updateCloneUrlMutation = useUpdateRepositoryCloneUrlMutation();
   const ownerProfileQuery = useUsersBatchQuery([project.owner], {
     enabled: Boolean(identityPubkey),
   });
@@ -92,6 +103,9 @@ export function ProjectRepositoryManagement({
   const canManageAccess =
     Boolean(repository) &&
     accessChannels.length > 0 &&
+    identityPubkey?.toLowerCase() === repository?.owner.toLowerCase();
+  const viewerOwnsRepository =
+    Boolean(repository) &&
     identityPubkey?.toLowerCase() === repository?.owner.toLowerCase();
   const attachCandidates = React.useMemo(() => {
     const currentAddresses = new Set(project.repositoryAddresses);
@@ -244,6 +258,45 @@ export function ProjectRepositoryManagement({
             ))}
           </DropdownMenuContent>
         </DropdownMenu>
+      ) : null}
+      {repository && viewerOwnsRepository ? (
+        <Button
+          aria-label="Edit clone URL"
+          className={
+            compact
+              ? "h-6 w-6 shrink-0 rounded-md text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
+              : "h-7 shrink-0 gap-1.5 rounded-md"
+          }
+          data-testid="edit-repository-clone-url"
+          disabled={updateCloneUrlMutation.isPending}
+          onClick={() => setEditCloneUrlOpen(true)}
+          size={compact ? "icon" : "sm"}
+          type="button"
+          variant={compact ? "ghost" : "outline"}
+        >
+          <Pencil className={compact ? "h-4 w-4" : "h-3.5 w-3.5"} />
+          {compact
+            ? null
+            : updateCloneUrlMutation.isPending
+              ? "Saving…"
+              : "Edit URL"}
+        </Button>
+      ) : null}
+      {repository && viewerOwnsRepository ? (
+        <EditRepositoryCloneUrlDialog
+          cloneUrl={repository.cloneUrls[0] ?? ""}
+          isUpdating={updateCloneUrlMutation.isPending}
+          onEdit={async (url) => {
+            const updated = await updateCloneUrlMutation.mutateAsync({
+              cloneUrl: url,
+              repository,
+            });
+            toast.success(`Clone URL updated for "${updated.name}".`);
+          }}
+          onOpenChange={setEditCloneUrlOpen}
+          open={editCloneUrlOpen}
+          repository={repository}
+        />
       ) : null}
     </>
   );

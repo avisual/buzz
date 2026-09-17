@@ -5,6 +5,7 @@ import {
   buildRepositoryChannelBindingTemplate,
   buildProjectPatchTemplate,
   buildAddedRepositoryEventTemplatesFromHead,
+  buildRepositoryCloneUrlUpdateTemplate,
 } from "./projectRepositoryCreation.ts";
 import { validateProjectEventEnvelope } from "./projectModels.ts";
 
@@ -444,5 +445,110 @@ test("a coordinate in the live head WITH a live repository head is still a concu
         repositoryHeadExists: true,
       }),
     /already contains.*mobile.*another session/,
+  );
+});
+
+// ── buildRepositoryCloneUrlUpdateTemplate ───────────────────────────────────
+// Republishing a repository announcement at the SAME coordinate is what keeps
+// attached issues/PRs attached. A changed `d` tag moves the coordinate and
+// silently orphans everything — criterion 5 pins the d-tag through the
+// republish path.
+
+const CLONE_REPO = {
+  id: `${OWNER}:murmur`,
+  dtag: "murmur",
+  name: "Murmur",
+  description: "Text cleanup and inserter",
+  owner: OWNER,
+  createdAt: 100,
+  repoAddress: `30617:${OWNER}:murmur`,
+  eventContent: "Text cleanup and inserter",
+  eventTags: [
+    ["d", "murmur"],
+    ["name", "Murmur"],
+    ["description", "Text cleanup and inserter"],
+    ["buzz-channel", "11111111-1111-4111-8111-111111111111"],
+    ["clone", "file:///Users/claudia/git/wisper"],
+    ["x-custom", "preserve-me"],
+  ],
+};
+
+test("criterion 5: republish keeps the d-tag (and therefore the coordinate) unchanged", () => {
+  const template = buildRepositoryCloneUrlUpdateTemplate({
+    cloneUrl: "https://github.com/avisual/murmur",
+    ownerPubkey: OWNER,
+    repository: CLONE_REPO,
+  });
+
+  const dTags = template.tags.filter((tag) => tag[0] === "d");
+  assert.equal(dTags.length, 1, "exactly one d-tag must survive the republish");
+  assert.equal(dTags[0][1], "murmur", "the d-tag must be byte-identical to the original");
+  // The coordinate is what attached issues and PRs resolve against.
+  assert.equal(`30617:${OWNER}:${dTags[0][1]}`, CLONE_REPO.repoAddress,
+    "coordinate invariant: republish lands at the same coordinate");
+  assert.equal(template.kind, 30617);
+});
+
+test("clone URL is replaced, not appended", () => {
+  const template = buildRepositoryCloneUrlUpdateTemplate({
+    cloneUrl: "https://github.com/avisual/murmur",
+    ownerPubkey: OWNER,
+    repository: CLONE_REPO,
+  });
+  const cloneTags = template.tags.filter((tag) => tag[0] === "clone");
+  assert.deepEqual(cloneTags, [["clone", "https://github.com/avisual/murmur"]]);
+  assert.ok(!template.tags.some((t) => t[1] === "file:///Users/claudia/git/wisper"),
+    "the old clone URL must be gone");
+});
+
+test("unknown tags and buzz-channel survive the republish", () => {
+  const template = buildRepositoryCloneUrlUpdateTemplate({
+    cloneUrl: "https://github.com/avisual/murmur",
+    ownerPubkey: OWNER,
+    repository: CLONE_REPO,
+  });
+  assert.deepEqual(template.tags, [
+    ["d", "murmur"],
+    ["name", "Murmur"],
+    ["description", "Text cleanup and inserter"],
+    ["buzz-channel", "11111111-1111-4111-8111-111111111111"],
+    ["x-custom", "preserve-me"],
+    ["clone", "https://github.com/avisual/murmur"],
+  ]);
+});
+
+test("empty clone URL removes the clone tag (falls back to relay-hosted)", () => {
+  const template = buildRepositoryCloneUrlUpdateTemplate({
+    cloneUrl: "   ",
+    ownerPubkey: OWNER,
+    repository: CLONE_REPO,
+  });
+  assert.ok(!template.tags.some((tag) => tag[0] === "clone"),
+    "no clone tag: relay-hosted default will be derived on read");
+  assert.equal(template.tags.filter((t) => t[0] === "d").length, 1);
+});
+
+test("non-owner cannot update the clone URL", () => {
+  assert.throws(
+    () =>
+      buildRepositoryCloneUrlUpdateTemplate({
+        cloneUrl: "https://github.com/avisual/murmur",
+        ownerPubkey: "b".repeat(64),
+        repository: CLONE_REPO,
+      }),
+    /Only the repository owner/,
+  );
+});
+
+test("missing eventTags is a clean error, not a crash", () => {
+  const { eventTags, ...noTags } = CLONE_REPO;
+  assert.throws(
+    () =>
+      buildRepositoryCloneUrlUpdateTemplate({
+        cloneUrl: "https://github.com/avisual/murmur",
+        ownerPubkey: OWNER,
+        repository: noTags,
+      }),
+    /Repository metadata is unavailable/,
   );
 });

@@ -129,6 +129,40 @@ export function buildRepositoryChannelBindingTemplate({
   };
 }
 
+export function buildRepositoryCloneUrlUpdateTemplate({
+  cloneUrl,
+  ownerPubkey,
+  repository,
+}: {
+  cloneUrl: string;
+  ownerPubkey: string;
+  repository: Repository;
+}): ProjectEventTemplate {
+  const normalizedOwner = ownerPubkey.trim().toLowerCase();
+  if (normalizedOwner !== repository.owner.toLowerCase()) {
+    throw new Error("Only the repository owner can update its clone URL.");
+  }
+  if (!repository.eventTags) {
+    throw new Error(
+      "Repository metadata is unavailable. Refresh and try again.",
+    );
+  }
+  const normalizedCloneUrl = cloneUrl.trim();
+  const tags: string[][] = [
+    ...repository.eventTags
+      .filter((tag) => tag[0] !== "clone")
+      .map((tag) => [...tag]),
+  ];
+  if (normalizedCloneUrl) {
+    tags.push(["clone", normalizedCloneUrl]);
+  }
+  return {
+    kind: KIND_REPO_ANNOUNCEMENT,
+    content: repository.eventContent ?? repository.description,
+    tags,
+  };
+}
+
 export type AddedRepositoryEventTemplatesFromHead = {
   project: ProjectEventTemplate;
   repository: ProjectEventTemplate;
