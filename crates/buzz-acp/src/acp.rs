@@ -2223,6 +2223,27 @@ pub fn extract_thought_level_config_id(result: &serde_json::Value) -> Option<Str
     None
 }
 
+/// Extract the `configId` for the `mode` category option from a `session/new`
+/// result, if the adapter advertised one.
+///
+/// opencode's adapter lists its agents (implementer, verifier, Sisyphus, ...)
+/// as a `configOptions` entry with `category: "mode"`. The configId is
+/// adapter-defined and must not be hardcoded — discovered at session time,
+/// mirroring [`extract_thought_level_config_id`].
+pub fn extract_mode_config_id(result: &serde_json::Value) -> Option<String> {
+    let arr = result["configOptions"].as_array()?;
+    for opt in arr {
+        if opt.get("category").and_then(|c| c.as_str()) == Some("mode") {
+            let config_id = opt
+                .get("configId")
+                .or_else(|| opt.get("id"))
+                .and_then(|v| v.as_str())?;
+            return Some(config_id.to_string());
+        }
+    }
+    None
+}
+
 /// Match a desired model ID against a fresh `session/new` response.
 ///
 /// Returns the correct ACP method to call, or `None` if no match.

@@ -450,6 +450,12 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_EFFORT_LEVEL")]
     pub effort_level: Option<String>,
 
+    /// Persisted opencode agent id (e.g. "implementer", "verifier") to apply
+    /// via `session/set_config_option` category "mode" at session creation.
+    /// Non-fatal: if the adapter advertises no "mode" option, silently ignored.
+    #[arg(long, env = "BUZZ_ACP_AGENT_MODE")]
+    pub agent_mode: Option<String>,
+
     /// Title for the agent's ACP sessions, passed out-of-band in `session/new`
     /// `_meta`. Adapters that recognize it name the session after this value;
     /// others ignore it. Never enters the prompt.
@@ -584,6 +590,10 @@ pub struct Config {
     /// Non-fatal when absent or when the adapter does not advertise
     /// `thought_level`.
     pub effort_level: Option<String>,
+    /// Persisted opencode agent id applied at session creation via
+    /// `session/set_config_option` category "mode". Non-fatal when absent or
+    /// when the adapter advertises no "mode" option.
+    pub agent_mode: Option<String>,
     /// Sanitized session title, sent as `_meta.sessionTitle` on `session/new`.
     /// `None` when unset or when the configured value sanitized to empty.
     pub session_title: Option<String>,
@@ -1186,6 +1196,7 @@ impl Config {
             memory_enabled: args.memory && !args.no_memory,
             model,
             effort_level: args.effort_level,
+            agent_mode: args.agent_mode,
             session_title: args
                 .session_title
                 .as_deref()
@@ -1565,6 +1576,7 @@ mod tests {
             memory_enabled: true,
             model: None,
             effort_level: None,
+            agent_mode: None,
             session_title: None,
             permission_mode: PermissionMode::BypassPermissions,
             respond_to: RespondTo::Anyone,

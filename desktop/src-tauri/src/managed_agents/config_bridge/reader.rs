@@ -235,6 +235,14 @@ pub(crate) fn read_config_surface(
     let effort_config_id = effort_option.map(|o| o.config_id.clone());
     let effort_options = effort_option.map(|o| o.options.clone()).unwrap_or_default();
 
+    // The adapter-advertised mode control (opencode lists its agents as a
+    // `mode` category option). Same single-entry derivation as effort: the
+    // write config id and the picker options come from one entry, so the UI
+    // never hardcodes agent ids.
+    let mode_option = session_cache.and_then(find_mode_option);
+    let mode_config_id = mode_option.map(|o| o.config_id.clone());
+    let mode_options = mode_option.map(|o| o.options.clone()).unwrap_or_default();
+
     RuntimeConfigSurface {
         runtime_id: runtime_meta.map(|m| m.id.to_string()),
         runtime_label: runtime_meta.map(|m| m.label.to_string()),
@@ -246,6 +254,8 @@ pub(crate) fn read_config_surface(
         claude_config_dir_custom: claude_config_dir.is_some(),
         effort_config_id,
         effort_options,
+        mode_config_id,
+        mode_options,
     }
 }
 
@@ -849,6 +859,17 @@ fn find_effort_option(cache: &SessionConfigCache) -> Option<&AcpConfigOptionEntr
             .find(|o| o.category.as_deref() == Some(category))
     };
     by_category("thought_level").or_else(|| by_category("effort"))
+}
+
+/// Selects the adapter-advertised mode control from the session cache.
+/// opencode advertises its agents (implementer, verifier, ...) as a
+/// `mode` category option. Selected by category, never by id, so the
+/// config id the UI sends back is always the one the adapter emitted.
+fn find_mode_option(cache: &SessionConfigCache) -> Option<&AcpConfigOptionEntry> {
+    cache
+        .config_options
+        .iter()
+        .find(|o| o.category.as_deref() == Some("mode"))
 }
 
 fn has_config_option(cache: Option<&SessionConfigCache>, category: &str) -> bool {

@@ -269,6 +269,7 @@ fn record_with(
         definition_parallelism: None,
         relay_mesh: None,
         effort_level: None,
+        agent_mode: None,
     }
 }
 

@@ -30,9 +30,10 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 use crate::acp::{
-    extract_model_config_options, extract_model_state, extract_thought_level_config_id,
-    model_in_catalog, resolve_model_switch_method, AcpClient, AcpError, EnvVar, McpServer,
-    ModelSwitchMethod, StopReason, SystemPromptTransport, BUZZ_PI_ACP_NAME,
+    extract_mode_config_id, extract_model_config_options, extract_model_state,
+    extract_thought_level_config_id, model_in_catalog, resolve_model_switch_method, AcpClient,
+    AcpError, EnvVar, McpServer, ModelSwitchMethod, StopReason, SystemPromptTransport,
+    BUZZ_PI_ACP_NAME,
 };
 use crate::config::{compose_scoped_session_title, DedupMode, PermissionMode};
 use crate::observer;
@@ -296,6 +297,13 @@ pub struct OwnedAgent {
     /// Non-fatal when absent or when the adapter does not advertise
     /// `thought_level`.
     pub startup_effort: Option<String>,
+    /// Persisted startup agent-mode value from `BUZZ_ACP_AGENT_MODE` (carried
+    /// from the Desktop record via `Config.agent_mode`). Held per-worker and
+    /// applied once, at the first session creation, via
+    /// `session/set_config_option` on the adapter's `mode` config option.
+    /// Spawn-scoped only — no pool-level mode state, no live switching.
+    /// Non-fatal when absent or when the adapter advertises no `mode` option.
+    pub startup_agent_mode: Option<String>,
     /// Normalized agent name from initialize (`agentInfo.name`/`serverInfo.name`).
     pub agent_name: String,
     /// Whether Goose accepted its custom system-prompt method. `None` probes on
@@ -1698,6 +1706,7 @@ async fn create_session_and_apply_model(
     // the cached configOptions tell the truth about the running session.
     let effort_snapshot = post_switch_snapshot.as_ref().unwrap_or(&resp.raw);
     let effort_outcome = apply_startup_effort(agent, effort_snapshot, &resp.session_id).await?;
+    let mode_outcome = apply_startup_agent_mode(agent, effort_snapshot, &resp.session_id).await?;
 
     // Emit session config for desktop consumption (config bridge tier 1b).
     // Emitted AFTER desired_model resolution so the desktop caches the
@@ -1717,6 +1726,9 @@ async fn create_session_and_apply_model(
             .cloned()
             .unwrap_or(serde_json::Value::Null);
         if let Some(StartupEffortOutcome::Applied { config_id, value }) = &effort_outcome {
+            patch_config_option_current_value(&mut opts, config_id, value);
+        }
+        if let Some(StartupAgentModeOutcome::Applied { config_id, value }) = &mode_outcome {
             patch_config_option_current_value(&mut opts, config_id, value);
         }
         opts
@@ -1892,6 +1904,15 @@ enum StartupEffortOutcome {
     Rejected,
 }
 
+/// Outcome of applying a worker's spawn-scoped startup agent mode at session
+/// creation. Same shape and semantics as [`StartupEffortOutcome`]: only
+/// `Applied` patches the cached `currentValue`; `Rejected` and the `None`
+/// return leave the session/new snapshot untouched.
+enum StartupAgentModeOutcome {
+    Applied { config_id: String, value: String },
+    Rejected,
+}
+
 /// Apply the worker's held `startup_effort` via `session/set_config_option`, if
 /// set and the current model advertises a `thought_level` option.
 ///
@@ -1960,6 +1981,77 @@ async fn apply_startup_effort(
             tracing::error!(
                 target: "pool::effort",
                 "startup effort {value} via configId={config_id} timed out ({MODEL_SWITCH_TIMEOUT:?}) — treating as fatal"
+            );
+            Err(AcpError::Timeout(MODEL_SWITCH_TIMEOUT))
+        }
+    }
+}
+
+/// Apply the worker's held `startup_agent_mode` via `session/set_config_option`,
+/// if set and the adapter advertises a `mode` category option.
+///
+/// Returns `Ok(None)` when there is nothing to apply (no configured mode, or
+/// the adapter advertises no `mode` option) or `Ok(Some(_))` describing whether
+/// the adapter accepted the value. Transport-class errors propagate as `Err` so
+/// the caller respawns the worker rather than reuse a poisoned stream — mirroring
+/// [`apply_startup_effort`]'s classification. Application-level rejection is
+/// non-fatal: the session proceeds on the adapter's default agent.
+async fn apply_startup_agent_mode(
+    agent: &mut OwnedAgent,
+    session_new_result: &serde_json::Value,
+    session_id: &str,
+) -> Result<Option<StartupAgentModeOutcome>, AcpError> {
+    let Some(value) = agent.startup_agent_mode.clone() else {
+        return Ok(None);
+    };
+    let Some(config_id) = extract_mode_config_id(session_new_result) else {
+        tracing::info!(
+            target: "pool::mode",
+            "startup agent mode {value} configured but adapter advertises no mode option — leaving adapter default"
+        );
+        return Ok(None);
+    };
+
+    let result = tokio::time::timeout(MODEL_SWITCH_TIMEOUT, async {
+        agent
+            .acp
+            .session_set_config_option(session_id, &config_id, &value)
+            .await
+    })
+    .await;
+
+    match result {
+        Ok(Ok(_)) => {
+            tracing::info!(
+                target: "pool::mode",
+                "applied startup agent mode {value} via configId={config_id} on session {session_id}"
+            );
+            Ok(Some(StartupAgentModeOutcome::Applied { config_id, value }))
+        }
+        Ok(Err(e @ AcpError::Io(_)))
+        | Ok(Err(e @ AcpError::WriteTimeout(_)))
+        | Ok(Err(e @ AcpError::Timeout(_)))
+        | Ok(Err(e @ AcpError::Protocol(_)))
+        | Ok(Err(e @ AcpError::AgentExited)) => {
+            tracing::error!(
+                target: "pool::mode",
+                "fatal error applying startup agent mode {value} via configId={config_id}: {e}"
+            );
+            Err(e)
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(
+                target: "pool::mode",
+                "adapter rejected startup agent mode {value} via configId={config_id}: {e} — proceeding with adapter default"
+            );
+            Ok(Some(StartupAgentModeOutcome::Rejected))
+        }
+        Err(_) => {
+            // Outer timeout fired — the inner send_request may have left the
+            // stream in an unknown state. Treat as transport error.
+            tracing::error!(
+                target: "pool::mode",
+                "startup agent mode {value} via configId={config_id} timed out ({MODEL_SWITCH_TIMEOUT:?}) — treating as fatal"
             );
             Err(AcpError::Timeout(MODEL_SWITCH_TIMEOUT))
         }
@@ -6916,6 +7008,7 @@ done"#
             desired_model_request_id: None,
             desired_model_pending_ack: false,
             startup_effort: None,
+            startup_agent_mode: None,
             agent_name: "legacy-test-agent".into(),
             goose_system_prompt_supported: None,
             protocol_version: 1,
@@ -7016,6 +7109,7 @@ done"#
             desired_model_request_id: None,
             desired_model_pending_ack: false,
             startup_effort: None,
+            startup_agent_mode: None,
             agent_name: "legacy-test-agent".into(),
             goose_system_prompt_supported: None,
             protocol_version: 1,
@@ -7203,6 +7297,7 @@ done"#
             desired_model_request_id: None,
             desired_model_pending_ack: false,
             startup_effort: None,
+            startup_agent_mode: None,
             agent_name: "legacy-test-agent".into(),
             goose_system_prompt_supported: None,
             protocol_version: 1,
@@ -7411,6 +7506,7 @@ done"#
             desired_model_request_id: None,
             desired_model_pending_ack: false,
             startup_effort: None,
+            startup_agent_mode: None,
             agent_name: "legacy-test-agent".into(),
             goose_system_prompt_supported: None,
             protocol_version: 1,
@@ -7565,6 +7661,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             desired_model_request_id: None,
             desired_model_pending_ack: false,
             startup_effort: None,
+            startup_agent_mode: None,
             agent_name: "legacy-test-agent".into(),
             goose_system_prompt_supported: None,
             protocol_version: 1,
@@ -8274,6 +8371,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             desired_model_request_id: None,
             desired_model_pending_ack: false,
             startup_effort: None,
+            startup_agent_mode: None,
             agent_name: "test".into(),
             goose_system_prompt_supported: None,
             protocol_version: 2,
@@ -8356,6 +8454,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             desired_model_request_id: None,
             desired_model_pending_ack: false,
             startup_effort: None,
+            startup_agent_mode: None,
             agent_name: "test".into(),
             goose_system_prompt_supported: None,
             protocol_version: 2,
@@ -9412,6 +9511,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             desired_model_request_id: None,
             desired_model_pending_ack: false,
             startup_effort: None,
+            startup_agent_mode: None,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
             protocol_version: 2,
@@ -9473,6 +9573,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             desired_model_request_id: None,
             desired_model_pending_ack: false,
             startup_effort: None,
+            startup_agent_mode: None,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
             protocol_version: 2,
@@ -10588,6 +10689,7 @@ done"#
             desired_model_request_id: None,
             desired_model_pending_ack: false,
             startup_effort: None,
+            startup_agent_mode: None,
             agent_name: "boundary-test-agent".into(),
             goose_system_prompt_supported: None,
             protocol_version: 1,
@@ -10982,6 +11084,7 @@ mod startup_effort_tests {
             desired_model_request_id: None,
             desired_model_pending_ack: false,
             startup_effort: startup_effort.map(str::to_string),
+            startup_agent_mode: None,
             agent_name: "effort-test-agent".into(),
             goose_system_prompt_supported: None,
             protocol_version: 2,
@@ -11223,6 +11326,232 @@ exit 0"#
 }
 
 #[cfg(test)]
+mod startup_agent_mode_tests {
+    use super::*;
+    use crate::acp::AcpClient;
+    use tests::make_prompt_context_no_owner;
+
+    /// A protocol-v2 agent with a held spawn-scoped `startup_agent_mode`. The
+    /// only ACP requests are `session/new` (id 0) then the startup-mode
+    /// `session/set_config_option` (id 1).
+    fn mode_agent(acp: AcpClient, startup_agent_mode: Option<&str>) -> OwnedAgent {
+        OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            startup_agent_mode: startup_agent_mode.map(str::to_string),
+            agent_name: "mode-test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        }
+    }
+
+    /// Spawn a scripted ACP that answers `session/new` (request #1) with the
+    /// given configOptions, then replies to request #2 (the mode
+    /// `set_config_option`) with `mode_reply`. Every request line is appended
+    /// to `req_path` so tests can assert the exact wire call.
+    async fn spawn_mode_acp(
+        session_new_config_options: &str,
+        mode_reply: &str,
+        req_path: &str,
+    ) -> AcpClient {
+        let script = format!(
+            r#"count=0
+while IFS= read -r line; do
+  count=$((count + 1))
+  id=$((count - 1))
+  printf '%s\n' "$line" >> {req_path}
+  if [ "$count" -eq 1 ]; then
+    printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"sessionId":"sess-1","configOptions":{session_new_config_options}}}}}'
+  elif [ "$count" -eq 2 ]; then
+    printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',{mode_reply}}}'
+  else
+    printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"ok":true}}}}'
+  fi
+done"#
+        );
+        AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+            .await
+            .expect("spawn mode ACP script")
+    }
+
+    /// The opencode wire shape, measured 2026-09-16 from a live `opencode acp`
+    /// session/new: the mode option carries `id` (not `configId`), category
+    /// "mode", and `currentValue` = the adapter's default agent.
+    const OPTS_WITH_MODE: &str = r#"[{"id":"mode","name":"Session Mode","category":"mode","type":"select","currentValue":"implementer","options":[{"value":"implementer"},{"value":"verifier"}]}]"#;
+
+    const OPTS_WITHOUT_MODE: &str = r#"[{"configId":"model","category":"model","currentValue":"m-a","options":[{"value":"m-a"}]}]"#;
+
+    fn mode_current_value(options: &serde_json::Value) -> Option<String> {
+        options
+            .as_array()?
+            .iter()
+            .find(|o| o.get("category").and_then(|c| c.as_str()) == Some("mode"))
+            .and_then(|o| o["currentValue"].as_str())
+            .map(str::to_string)
+    }
+
+    fn captured_mode_options(obs: &observer::ObserverHandle) -> serde_json::Value {
+        obs.snapshot()
+            .into_iter()
+            .find(|e| e.kind == "session_config_captured")
+            .expect("session_config_captured emitted")
+            .payload["configOptions"]
+            .clone()
+    }
+
+    fn new_channel_ctx<'a>() -> NewSessionChannelContext<'a> {
+        NewSessionChannelContext {
+            huddle_instructions: None,
+            canvas: None,
+            name: None,
+            scope: None,
+            channel_type: None,
+        }
+    }
+
+    fn logged_requests(req_path: &std::path::Path) -> String {
+        std::fs::read_to_string(req_path).expect("request log written by fake ACP")
+    }
+
+    #[tokio::test]
+    async fn test_applied_agent_mode_sends_set_config_option_and_patches_capture() {
+        let req_path = std::env::temp_dir().join("buzz_acp_mode_req_applied.jsonl");
+        let _ = std::fs::remove_file(&req_path);
+        let acp = spawn_mode_acp(
+            OPTS_WITH_MODE,
+            r#""result":{"ok":true}"#,
+            req_path.to_str().unwrap(),
+        )
+        .await;
+        let mut agent = mode_agent(acp, Some("verifier"));
+        let obs = observer::ObserverHandle::in_process();
+        agent.acp.set_observer(Some(obs.clone()), 0);
+
+        let ctx = make_prompt_context_no_owner();
+        create_session_and_apply_model(&mut agent, &ctx, None, new_channel_ctx())
+            .await
+            .expect("session creation must succeed");
+
+        let opts = captured_mode_options(&obs);
+        assert_eq!(
+            mode_current_value(&opts).as_deref(),
+            Some("verifier"),
+            "applied agent mode must overwrite the pre-set currentValue in the capture"
+        );
+
+        let logged = logged_requests(&req_path);
+        let set_req = logged
+            .lines()
+            .find(|l| l.contains("session/set_config_option"))
+            .expect("a session/set_config_option request must have been sent");
+        let req: serde_json::Value = serde_json::from_str(set_req).unwrap();
+        assert_eq!(req["params"]["sessionId"], "sess-1");
+        assert_eq!(req["params"]["configId"], "mode");
+        assert_eq!(req["params"]["value"], "verifier");
+    }
+
+    #[tokio::test]
+    async fn test_rejected_agent_mode_retains_captured_current_value() {
+        let req_path = std::env::temp_dir().join("buzz_acp_mode_req_rejected.jsonl");
+        let _ = std::fs::remove_file(&req_path);
+        let acp = spawn_mode_acp(
+            OPTS_WITH_MODE,
+            r#""error":{"code":-32602,"message":"unknown mode"}"#,
+            req_path.to_str().unwrap(),
+        )
+        .await;
+        let mut agent = mode_agent(acp, Some("verifier"));
+        let obs = observer::ObserverHandle::in_process();
+        agent.acp.set_observer(Some(obs.clone()), 0);
+
+        let ctx = make_prompt_context_no_owner();
+        create_session_and_apply_model(&mut agent, &ctx, None, new_channel_ctx())
+            .await
+            .expect("a rejected mode is non-fatal; session creation still succeeds");
+
+        let opts = captured_mode_options(&obs);
+        assert_eq!(
+            mode_current_value(&opts).as_deref(),
+            Some("implementer"),
+            "a rejected agent mode must not falsify the capture — keep the running value"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_mode_option_leaves_capture_unpatched() {
+        let req_path = std::env::temp_dir().join("buzz_acp_mode_req_no_option.jsonl");
+        let _ = std::fs::remove_file(&req_path);
+        let acp = spawn_mode_acp(
+            OPTS_WITHOUT_MODE,
+            r#""result":{"ok":true}"#,
+            req_path.to_str().unwrap(),
+        )
+        .await;
+        let mut agent = mode_agent(acp, Some("verifier"));
+        let obs = observer::ObserverHandle::in_process();
+        agent.acp.set_observer(Some(obs.clone()), 0);
+
+        let ctx = make_prompt_context_no_owner();
+        create_session_and_apply_model(&mut agent, &ctx, None, new_channel_ctx())
+            .await
+            .expect("session creation must succeed");
+
+        let opts = captured_mode_options(&obs);
+        assert_eq!(
+            opts,
+            serde_json::from_str::<serde_json::Value>(OPTS_WITHOUT_MODE).unwrap(),
+            "no mode option advertised → the held mode is ignored and the capture is untouched"
+        );
+        assert!(
+            logged_requests(&req_path)
+                .lines()
+                .all(|l| !l.contains("set_config_option")),
+            "no set_config_option may be sent to an adapter with no mode option"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_startup_agent_mode_sends_nothing() {
+        let req_path = std::env::temp_dir().join("buzz_acp_mode_req_absent.jsonl");
+        let _ = std::fs::remove_file(&req_path);
+        let acp = spawn_mode_acp(
+            OPTS_WITH_MODE,
+            r#""result":{"ok":true}"#,
+            req_path.to_str().unwrap(),
+        )
+        .await;
+        let mut agent = mode_agent(acp, None);
+        let obs = observer::ObserverHandle::in_process();
+        agent.acp.set_observer(Some(obs.clone()), 0);
+
+        let ctx = make_prompt_context_no_owner();
+        create_session_and_apply_model(&mut agent, &ctx, None, new_channel_ctx())
+            .await
+            .expect("session creation must succeed");
+
+        let opts = captured_mode_options(&obs);
+        assert_eq!(
+            mode_current_value(&opts).as_deref(),
+            Some("implementer"),
+            "with no held mode the capture keeps the adapter default"
+        );
+        assert!(
+            logged_requests(&req_path)
+                .lines()
+                .all(|l| !l.contains("set_config_option")),
+            "no set_config_option when no startup mode is configured"
+        );
+    }
+}
+
+#[cfg(test)]
 mod model_switch_tests {
     use super::*;
     use crate::acp::AcpClient;
@@ -11242,6 +11571,7 @@ mod model_switch_tests {
             desired_model_request_id: None,
             desired_model_pending_ack: false,
             startup_effort: None,
+            startup_agent_mode: None,
             agent_name: "switch-test-agent".into(),
             goose_system_prompt_supported: None,
             protocol_version: 2,
@@ -11817,6 +12147,7 @@ done"#
             desired_model_request_id: None,
             desired_model_pending_ack: false,
             startup_effort: Some(startup_effort.to_string()),
+            startup_agent_mode: None,
             agent_name: "switch-effort-test-agent".into(),
             goose_system_prompt_supported: None,
             protocol_version: 2,

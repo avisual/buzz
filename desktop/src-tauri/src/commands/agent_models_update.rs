@@ -317,6 +317,14 @@ pub async fn update_managed_agent(
             inherit_transition,
             input.effort_level,
         )?;
+        // Agent mode: plain set/clear on the canonical column — no alias
+        // sweep, no backend gate (the harness no-ops on adapters without a
+        // `mode` option). Takes effect at the next runner spawn.
+        if let Some(agent_mode) = input.agent_mode {
+            record.agent_mode = agent_mode
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty());
+        }
 
         stamp_record_updated_at(record, applied);
 

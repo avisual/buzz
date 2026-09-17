@@ -96,6 +96,7 @@ fn record(
         team_catalog_source: None,
         relay_mesh: None,
         effort_level: None,
+        agent_mode: None,
         auto_restart_on_config_change: false,
         definition_respond_to: None,
         definition_respond_to_allowlist: vec![],

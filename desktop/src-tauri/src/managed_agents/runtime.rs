@@ -668,6 +668,15 @@ pub fn spawn_agent_child(
     } else {
         command.env_remove("BUZZ_ACP_MODEL");
     }
+    // Agent mode (opencode agent id) for the harness to apply at session
+    // creation. Emitted before the user env layer so a saved `BUZZ_ACP_AGENT_MODE`
+    // override wins — same authority order as the model. The harness no-ops it
+    // when the adapter advertises no `mode` option, so this is non-fatal here.
+    if let Some(mode) = record.agent_mode.as_deref() {
+        command.env("BUZZ_ACP_AGENT_MODE", mode);
+    } else {
+        command.env_remove("BUZZ_ACP_AGENT_MODE");
+    }
     // Session title for the harness to pass out-of-band on `session/new`. The
     // adapter names the session after it; it never reaches the prompt, so this
     // is display metadata only. The spawn-config snapshot records the same

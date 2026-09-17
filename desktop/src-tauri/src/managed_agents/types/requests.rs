@@ -275,6 +275,11 @@ pub struct UpdateManagedAgentRequest {
     /// the record-scope alias sweep runs atomically with the column write.
     #[serde(default, deserialize_with = "crate::util::double_option")]
     pub effort_level: Option<Option<String>>,
+    /// Absent = don't touch. `null` = clear to the adapter's default agent.
+    /// `"value"` = set the canonical opencode agent id. No backend gate: the
+    /// harness no-ops when the adapter advertises no `mode` option.
+    #[serde(default, deserialize_with = "crate::util::double_option")]
+    pub agent_mode: Option<Option<String>>,
 }
 
 #[cfg(test)]

@@ -222,6 +222,7 @@ fn managed_agent(name: &str) -> ManagedAgentRecord {
         team_catalog_source: None,
         relay_mesh: None,
         effort_level: None,
+        agent_mode: None,
         definition_respond_to: None,
         definition_respond_to_allowlist: vec![],
         definition_parallelism: None,

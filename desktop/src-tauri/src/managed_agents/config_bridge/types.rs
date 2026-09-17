@@ -207,6 +207,18 @@ pub struct RuntimeConfigSurface {
     /// are reflected correctly.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effort_options: Vec<AcpConfigOptionValue>,
+    /// The adapter-advertised configId for the `mode` ACP config option,
+    /// as advertised by the adapter in `session/new`. Present only for
+    /// adapters that advertise a `mode` config option after the first
+    /// session is created. The UI uses this to send `set_config_option`
+    /// without hardcoding the configId.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode_config_id: Option<String>,
+    /// Adapter-advertised option values for the `mode` config option.
+    /// Present when `mode_config_id` is Some. The UI renders these instead
+    /// of hardcoded agent ids.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mode_options: Vec<AcpConfigOptionValue>,
 }
 
 /// Raw config values extracted from a runtime's config file.

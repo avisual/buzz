@@ -100,6 +100,7 @@ fn record() -> ManagedAgentRecord {
         definition_parallelism: None,
         relay_mesh: None,
         effort_level: None,
+        agent_mode: None,
     }
 }
 
@@ -410,6 +411,21 @@ fn non_default_max_turn_duration_changes_snapshot() {
     assert_ne!(
         snapshot(&rec, &[], &[], "wss://ws.example", &Default::default()),
         snapshot(&edited, &[], &[], "wss://ws.example", &Default::default())
+    );
+}
+
+#[test]
+fn agent_mode_edit_changes_snapshot() {
+    // Spawn writes BUZZ_ACP_AGENT_MODE from record.agent_mode, so an agent-mode
+    // edit must trip the badge: the running session keeps its old agent until it
+    // restarts. The canonical snapshot must therefore carry the field.
+    let rec = record();
+    let mut edited = record();
+    edited.agent_mode = Some("verifier".into());
+    assert_ne!(
+        snap(&rec),
+        snap(&edited),
+        "an agent-mode edit changes the spawned agent and must badge"
     );
 }
 

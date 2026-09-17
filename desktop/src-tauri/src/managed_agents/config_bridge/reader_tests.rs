@@ -123,6 +123,7 @@ fn test_record() -> ManagedAgentRecord {
         definition_parallelism: None,
         relay_mesh: None,
         effort_level: None,
+        agent_mode: None,
         agent_command_override: None,
         persona_source_version: None,
         provider: None,
@@ -301,6 +302,82 @@ fn post_spawn_with_model_config_option_uses_acp() {
         model.write_via,
         ConfigWriteMechanism::AcpSetConfigOption { .. }
     ));
+}
+
+#[test]
+fn post_spawn_with_mode_config_option_surfaces_mode_config_id_and_options() {
+    // The adapter (opencode) advertises its agents under a `mode`-category
+    // config option. The reader must surface that option's configId and values
+    // verbatim so the UI never hardcodes agent ids.
+    let record = test_record();
+    let runtime = test_runtime();
+    let cache = SessionConfigCache {
+        config_options: vec![
+            AcpConfigOptionEntry {
+                config_id: "model".to_string(),
+                category: Some("model".to_string()),
+                display_name: Some("Model".to_string()),
+                current_value: Some("claude-opus-4".to_string()),
+                options: vec![],
+            },
+            AcpConfigOptionEntry {
+                config_id: "agent".to_string(),
+                category: Some("mode".to_string()),
+                display_name: Some("Agent".to_string()),
+                current_value: Some("implementer".to_string()),
+                options: vec![
+                    AcpConfigOptionValue {
+                        value: "implementer".to_string(),
+                        display_name: Some("Implementer".to_string()),
+                    },
+                    AcpConfigOptionValue {
+                        value: "verifier".to_string(),
+                        display_name: Some("Verifier".to_string()),
+                    },
+                ],
+            },
+        ],
+        available_modes: vec![],
+        available_models: vec![],
+        current_model: Some("claude-opus-4".to_string()),
+        model_overridden: false,
+        goose_native_config: None,
+        captured_at: "".to_string(),
+    };
+
+    let surface = read_config_surface(&record, Some(runtime), Some(&cache), &no_tiers(), None);
+    assert_eq!(surface.mode_config_id.as_deref(), Some("agent"));
+    assert_eq!(surface.mode_options.len(), 2);
+    assert_eq!(surface.mode_options[0].value.as_str(), "implementer");
+    assert_eq!(surface.mode_options[1].value.as_str(), "verifier");
+}
+
+#[test]
+fn no_mode_config_option_surfaces_none_and_empty_mode_options() {
+    // An adapter that advertises no `mode` option leaves mode_config_id None
+    // and mode_options empty — the UI then shows no picker rather than a
+    // hardcoded one.
+    let record = test_record();
+    let runtime = test_runtime();
+    let cache = SessionConfigCache {
+        config_options: vec![AcpConfigOptionEntry {
+            config_id: "model".to_string(),
+            category: Some("model".to_string()),
+            display_name: Some("Model".to_string()),
+            current_value: Some("claude-opus-4".to_string()),
+            options: vec![],
+        }],
+        available_modes: vec![],
+        available_models: vec![],
+        current_model: Some("claude-opus-4".to_string()),
+        model_overridden: false,
+        goose_native_config: None,
+        captured_at: "".to_string(),
+    };
+
+    let surface = read_config_surface(&record, Some(runtime), Some(&cache), &no_tiers(), None);
+    assert_eq!(surface.mode_config_id, None);
+    assert!(surface.mode_options.is_empty());
 }
 
 #[test]

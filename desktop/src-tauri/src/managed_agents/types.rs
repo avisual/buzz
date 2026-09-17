@@ -174,6 +174,7 @@ impl AgentDefinition {
             definition_parallelism: self.parallelism,
             relay_mesh: None,
             effort_level: None,
+            agent_mode: None,
         }
     }
 }
@@ -488,6 +489,14 @@ pub struct ManagedAgentRecord {
     /// switches (invalid values skip-as-absent at projection time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort_level: Option<String>,
+    /// Canonical opencode agent id (e.g. "verifier") applied by the harness at
+    /// session creation via `session/set_config_option` on the adapter's
+    /// `mode` config option. `None` = adapter default agent. Emitted at spawn
+    /// as `BUZZ_ACP_AGENT_MODE` (before the user env layer, so a saved env
+    /// override wins — same authority order as `model`). Non-fatal when the
+    /// adapter advertises no `mode` option.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_mode: Option<String>,
 }
 
 #[derive(Debug)]

@@ -143,6 +143,11 @@ pub(crate) struct SpawnConfigSnapshot {
     /// sentinel, so any other effort-looking key the child receives stays in
     /// `env` as ordinary state and diffs normally.
     pub effort_level: Option<String>,
+    /// The opencode agent id the harness will apply at session creation
+    /// (`BUZZ_ACP_AGENT_MODE`). `None` = adapter default. Record-derived and
+    /// emitted before the user env layer at spawn, so a saved env override
+    /// reaches the child through `env` and diffs there (same order as model).
+    pub agent_mode: Option<String>,
     /// The effective ACP session policy this launch applies (`channel` or
     /// `thread`). The harness reads `BUZZ_ACP_SESSION_POLICY` only at launch, so
     /// capturing the resolved policy here lets a toggle flip while an agent runs
@@ -256,6 +261,7 @@ impl SpawnConfigSnapshot {
             // resolver left in `descriptor.env`, so the badge compares exactly
             // what launched regardless of which tier supplied the value.
             effort_level: effective_effort(descriptor),
+            agent_mode: record.agent_mode.clone(),
             session_policy: session_policy.as_str().to_string(),
         }
     }
