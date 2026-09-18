@@ -473,6 +473,8 @@ const CLONE_REPO = {
   ],
 };
 
+const AGENT_PUBKEY = "be11ed729e0b47ccb25e34c598b64bb0ff16199ea794b9999e809ae63cfc8dea";
+
 test("criterion 5: republish keeps the d-tag (and therefore the coordinate) unchanged", () => {
   const template = buildRepositoryCloneUrlUpdateTemplate({
     cloneUrl: "https://github.com/avisual/murmur",
@@ -483,10 +485,29 @@ test("criterion 5: republish keeps the d-tag (and therefore the coordinate) unch
   const dTags = template.tags.filter((tag) => tag[0] === "d");
   assert.equal(dTags.length, 1, "exactly one d-tag must survive the republish");
   assert.equal(dTags[0][1], "murmur", "the d-tag must be byte-identical to the original");
-  // The coordinate is what attached issues and PRs resolve against.
-  assert.equal(`30617:${OWNER}:${dTags[0][1]}`, CLONE_REPO.repoAddress,
-    "coordinate invariant: republish lands at the same coordinate");
+  // Coordinate is kind:pubkey:dtag (projectModels.ts:302). The pubkey is set
+  // by the signer, not stored in the template, so the republish only lands at
+  // the original coordinate when signed by the owner's key.
+  const coordinate = `${template.kind}:${OWNER.toLowerCase()}:${dTags[0][1]}`;
+  assert.equal(coordinate, CLONE_REPO.repoAddress,
+    "owner-signed republish lands at the same coordinate");
   assert.equal(template.kind, 30617);
+});
+
+test("criterion 5 (signer): a non-owner signer produces a different coordinate", () => {
+  const template = buildRepositoryCloneUrlUpdateTemplate({
+    cloneUrl: "https://github.com/avisual/murmur",
+    ownerPubkey: OWNER,
+    repository: CLONE_REPO,
+  });
+  const dtag = template.tags.find((t) => t[0] === "d")[1];
+
+  // a5f3b345 was signed by the agent key below, so it landed at
+  // 30617:be11ed72…:murmur — a NEW announcement, not a republish of
+  // 30617:362a53fb…:murmur. This test pins that failure mode.
+  const agentCoordinate = `${template.kind}:${AGENT_PUBKEY.toLowerCase()}:${dtag}`;
+  assert.notEqual(agentCoordinate, CLONE_REPO.repoAddress,
+    "agent-signed republish creates a new coordinate; the original is untouched");
 });
 
 test("clone URL is replaced, not appended", () => {
